@@ -1,0 +1,35 @@
+# systemd unit for the confer-bridge OpenAI-compatible facade.
+#
+# Install (see README "Deploying on a Raspberry Pi"):
+#   sudo cp deploy/confer-bridge.service /etc/systemd/system/
+#   sudo cp deploy/confer-bridge.env.example /etc/confer-bridge.env   # then edit
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now confer-bridge
+#
+# Logs: journalctl -u confer-bridge -f
+
+[Unit]
+Description=confer.to OpenAI-compatible facade
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=confer-bridge
+WorkingDirectory=/opt/confer-bridge
+ExecStart=/usr/bin/node dist/openai/main.js
+EnvironmentFile=/etc/confer-bridge.env
+
+Restart=on-failure
+RestartSec=5
+
+# Light hardening. The service only needs read access to its install dir and
+# no write access anywhere; drop capabilities and restrict filesystem views.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=-/opt/confer-bridge
+
+[Install]
+WantedBy=multi-user.target

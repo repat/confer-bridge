@@ -1,0 +1,11 @@
+node_modules/
+dist/
+confer-bridge-pi.tar.gz
+.env
+.env.*
+!.env.example
+*.har
+captures/
+test-output/
+coverage/
+**/.DS_Store

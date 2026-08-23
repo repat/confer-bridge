@@ -1,0 +1,33 @@
+{
+  "name": "confer-openai-compatible-api",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Personal OpenAI-compatible API gateway backed by confer.to's attested confidential-computing inference",
+  "type": "module",
+  "scripts": {
+    "analyze:har": "node scripts/analyze-har.mjs",
+    "extract:metro": "node scripts/extract-metro-modules.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/openai/main.js",
+    "pack:pi": "npm run build && tar -czf confer-bridge-pi.tar.gz dist package.json package-lock.json deploy"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@freedomofpress/sigstore-browser": "^0.1.14",
+    "@noble/ciphers": "^2.3.0",
+    "@noble/curves": "^2.3.0",
+    "@noble/hashes": "^2.3.0",
+    "jose": "^6.2.10",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}
