@@ -155,18 +155,20 @@ curl http://127.0.0.1:8080/v1/chat/completions \
        "messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-Supported today:
+Request fields fall into three categories:
 
-- `GET /v1/models` — the single upstream model
-- `POST /v1/chat/completions` — `model`, `messages`, `stream`, `temperature`,
-  `top_p`, `presence_penalty`, `frequency_penalty`, `max_tokens`
-- Streaming via SSE (`stream: true`) with standard `chat.completion.chunk`
-  frames and `[DONE]` termination; upstream thinking deltas appear as
-  `reasoning_content` only when `FACADE_EXPOSE_THINKING=1`
+1. **Supported (mapped onto the upstream)**: `model`, `messages`, `stream`,
+   `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`,
+   `max_tokens`
+2. **Accepted and ignored** (no faithful upstream mapping, but common SDKs
+   send them): `stream_options`, `user`
+3. **Rejected with an explicit 400**: everything else — tools,
+   `response_format`, `n > 1`, unknown models, …
 
-Anything that cannot be mapped faithfully onto the upstream (tools,
-`response_format`, `n > 1`, unknown models, …) is rejected with an explicit
-400 rather than silently ignored.
+Streaming via SSE (`stream: true`) uses standard `chat.completion.chunk`
+frames terminated by `[DONE]`; upstream thinking deltas appear as
+`reasoning_content` only when `FACADE_EXPOSE_THINKING=1`. Usage statistics in
+streams are not emitted (`stream_options.include_usage` is ignored).
 
 ## Deploying on a Raspberry Pi
 

@@ -32,6 +32,16 @@ const SUPPORTED_REQUEST_FIELDS = new Set([
   'max_tokens',
 ]);
 
+/**
+ * Fields OpenAI clients may send that we accept but deliberately ignore —
+ * no faithful upstream mapping exists, yet rejecting them breaks common
+ * SDKs (e.g. nanobot sends stream_options on every streaming request).
+ */
+const IGNORED_REQUEST_FIELDS = new Set([
+  'stream_options', // toggles usage-in-stream; we never emit usage chunks
+  'user', // OpenAI end-user identifier; meaningless here
+]);
+
 export class UnsupportedParameterError extends Error {
   constructor(public readonly field: string) {
     super(`Unsupported parameter: "${field}" is not supported by this facade.`);
@@ -125,9 +135,9 @@ function parseChatCompletionBody(bodyText: string): ParsedChatRequest {
   const record = parsed as Record<string, unknown>;
 
   for (const field of Object.keys(record)) {
-    if (!SUPPORTED_REQUEST_FIELDS.has(field)) {
-      throw new UnsupportedParameterError(field);
-    }
+    if (SUPPORTED_REQUEST_FIELDS.has(field)) continue;
+    if (IGNORED_REQUEST_FIELDS.has(field)) continue; // accepted, no upstream effect
+    throw new UnsupportedParameterError(field);
   }
   if (typeof record['model'] !== 'undefined' && record['model'] !== FACADE_MODEL) {
     throw new UnsupportedParameterError(`model "${String(record['model'])}" is not available`);

@@ -174,6 +174,31 @@ test('unsupported parameters are rejected with explicit 400s', async () => {
   }
 });
 
+test('benign client fields (stream_options, user) are accepted and not leaked upstream', async () => {
+  const client = new MockClient();
+  const { server, url } = await startFacade(client);
+  try {
+    const { status, json } = await postJson(
+      url,
+      '/v1/chat/completions',
+      JSON.stringify({
+        messages: [{ role: 'user', content: 'x' }],
+        stream_options: { include_usage: true },
+        user: 'end-user-42',
+      }),
+    );
+    assert.equal(status, 200);
+    assert.equal(json.choices[0].message.content, 'confer-protocol-test');
+
+    // The ignored fields must not appear in the upstream request options.
+    assert.equal(client.calls.length, 1);
+    assert.ok(!('streamOptions' in client.calls[0]!.options));
+    assert.ok(!('user' in client.calls[0]!.options));
+  } finally {
+    server.close();
+  }
+});
+
 test('unknown model ids are rejected', async () => {
   const { server, url } = await startFacade(new MockClient());
   try {
