@@ -14,6 +14,7 @@ import {
   ConferClient,
   OBSERVED_CHAT_MODEL,
   type ChatMessage,
+  type ClientTool,
   type StreamEvent,
 } from '../confer/client.js';
 import { PaymentRequiredError } from '../confer/errors.js';
@@ -30,6 +31,8 @@ const SUPPORTED_REQUEST_FIELDS = new Set([
   'presence_penalty',
   'frequency_penalty',
   'max_tokens',
+  'tools',
+  'tool_choice',
 ]);
 
 /**
@@ -104,22 +107,157 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text);
 }
 
-function validateMessages(raw: unknown): ChatMessage[] {
+interface OpenAIToolCall {
+  id: string;
+  functionName: string;
+  arguments: string;
+}
+
+/**
+ * Transform OpenAI chat messages into upstream ChatMessages.
+ *
+ * Mappings (verified against confer-proxy's OpenAIWebsocketHandler):
+ * - assistant messages carrying tool_calls become one upstream `tool_call`
+ *   message per call, whose content is the JSON-encoded ToolCallContent
+ *   ({toolCallId, toolName, toolArguments}).
+ * - OpenAI role:"tool" result messages become a `tool_response` message with
+ *   JSON-encoded ToolResponseContent ({toolCallId, toolName, content}); the
+ *   tool name is recovered from the earlier assistant tool_calls.
+ */
+function transformMessages(raw: unknown): ChatMessage[] {
   if (!Array.isArray(raw) || raw.length === 0 || !raw.every((m) => typeof m === 'object' && m !== null)) {
     throw new UnsupportedParameterError('messages must be a non-empty array of message objects');
   }
-  return raw.map((m) => {
+
+  const out: ChatMessage[] = [];
+  // tool_call_id -> function name, for resolving role:"tool" messages.
+  const toolNamesById = new Map<string, string>();
+
+  for (const m of raw) {
     const record = m as Record<string, unknown>;
     const role = record['role'];
-    const content = record['content'];
-    if (typeof role !== 'string' || !['user', 'assistant', 'system', 'developer'].includes(role)) {
-      throw new UnsupportedParameterError(`messages[].role "${String(role)}" is not supported`);
+
+    switch (role) {
+      case 'system':
+      case 'developer':
+      case 'user': {
+        const content = record['content'];
+        if (typeof content !== 'string') {
+          throw new UnsupportedParameterError(`messages[].role "${role}" requires string content`);
+        }
+        out.push({ role, content });
+        break;
+      }
+      case 'assistant': {
+        const content = record['content'];
+        if (typeof content === 'string' && content.length > 0) {
+          out.push({ role: 'assistant', content });
+        }
+        const rawToolCalls = record['tool_calls'];
+        if (rawToolCalls === undefined && typeof content !== 'string') {
+          throw new UnsupportedParameterError('assistant message requires content or tool_calls');
+        }
+        if (!Array.isArray(rawToolCalls)) {
+          if (rawToolCalls !== undefined) {
+            throw new UnsupportedParameterError('tool_calls must be an array');
+          }
+          break;
+        }
+        for (const tc of rawToolCalls) {
+          const tcRecord = (tc ?? {}) as Record<string, unknown>;
+          const fn = (tcRecord['function'] ?? {}) as Record<string, unknown>;
+          const id = tcRecord['id'];
+          const fname = fn['name'];
+          if (typeof id !== 'string' || typeof fname !== 'string') {
+            throw new UnsupportedParameterError('tool_calls[].id and .function.name are required');
+          }
+          let args = fn['arguments'];
+          if (args === undefined || args === null) args = '{}';
+          if (typeof args !== 'string') args = JSON.stringify(args);
+          toolNamesById.set(id, fname);
+          out.push({
+            role: 'tool_call',
+            content: JSON.stringify({ toolCallId: id, toolName: fname, toolArguments: args }),
+          });
+        }
+        break;
+      }
+      case 'tool': {
+        const toolCallId = record['tool_call_id'];
+        const content = record['content'];
+        if (typeof toolCallId !== 'string' || toolCallId.length === 0) {
+          throw new UnsupportedParameterError('messages[].tool_call_id is required for tool results');
+        }
+        if (typeof content !== 'string') {
+          throw new UnsupportedParameterError('messages[].content must be a string for tool results');
+        }
+        const toolName = toolNamesById.get(toolCallId);
+        if (!toolName) {
+          throw new UnsupportedParameterError(
+            `tool result references unknown tool_call_id "${toolCallId}" (no preceding assistant tool_calls entry)`,
+          );
+        }
+        out.push({
+          role: 'tool_response',
+          content: JSON.stringify({ toolCallId, toolName, content }),
+        });
+        break;
+      }
+      default:
+        throw new UnsupportedParameterError(`messages[].role "${String(role)}" is not supported`);
     }
-    if (typeof content !== 'string') {
-      throw new UnsupportedParameterError('messages[].content must be a string');
+  }
+
+  return out;
+}
+
+/** Parse OpenAI `tools` into upstream clientTools; only function tools are supported. */
+function parseTools(raw: unknown): ClientTool[] | undefined {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) throw new UnsupportedParameterError('tools must be an array');
+  const tools: ClientTool[] = [];
+  for (const t of raw) {
+    const record = (t ?? {}) as Record<string, unknown>;
+    if (record['type'] !== 'function') {
+      throw new UnsupportedParameterError(
+        `tools[].type "${String(record['type'])}" is not supported (only "function")`,
+      );
     }
-    return { role, content } as ChatMessage;
-  });
+    const fn = (record['function'] ?? {}) as Record<string, unknown>;
+    const name = fn['name'];
+    if (typeof name !== 'string' || name.trim().length === 0 || name.length > 64) {
+      throw new UnsupportedParameterError('tools[].function.name must be a non-empty string (max 64 chars)');
+    }
+    const description = typeof fn['description'] === 'string' ? fn['description'] : '';
+    const parameters =
+      typeof fn['parameters'] === 'object' && fn['parameters'] !== null
+        ? (fn['parameters'] as Record<string, unknown>)
+        : {};
+    tools.push({ name, description, parameters });
+  }
+  return tools;
+}
+
+/** Apply OpenAI tool_choice semantics to the declared clientTools list. */
+function applyToolChoice(
+  rawChoice: unknown,
+  tools: ClientTool[] | undefined,
+): ClientTool[] | undefined {
+  if (rawChoice === undefined) return tools;
+  if (rawChoice === 'none') return undefined;
+  if (rawChoice === 'auto') return tools;
+  if (typeof rawChoice === 'object' && rawChoice !== null) {
+    const record = rawChoice as Record<string, unknown>;
+    if (record['type'] === 'function' && typeof record['function'] === 'object' && record['function'] !== null) {
+      const wanted = (record['function'] as Record<string, unknown>)['name'];
+      const filtered = (tools ?? []).filter((t) => t.name === wanted);
+      if (filtered.length === 0) {
+        throw new UnsupportedParameterError(`tool_choice references unknown tool "${String(wanted)}"`);
+      }
+      return filtered;
+    }
+  }
+  throw new UnsupportedParameterError(`tool_choice value ${JSON.stringify(rawChoice)} is not supported`);
 }
 
 function parseChatCompletionBody(bodyText: string): ParsedChatRequest {
@@ -143,7 +281,8 @@ function parseChatCompletionBody(bodyText: string): ParsedChatRequest {
     throw new UnsupportedParameterError(`model "${String(record['model'])}" is not available`);
   }
 
-  const messages = validateMessages(record['messages']);
+  const messages = transformMessages(record['messages']);
+  const clientTools = applyToolChoice(record['tool_choice'], parseTools(record['tools']));
   const numeric = (value: unknown, field: string): number | undefined => {
     if (typeof value === 'undefined') return undefined;
     if (typeof value !== 'number') throw new UnsupportedParameterError(`${field} must be a number`);
@@ -161,6 +300,7 @@ function parseChatCompletionBody(bodyText: string): ParsedChatRequest {
   if (frequencyPenalty !== undefined) options['frequencyPenalty'] = frequencyPenalty;
   const maxTokens = numeric(record['max_tokens'], 'max_tokens');
   if (maxTokens !== undefined) options['maxTokens'] = Math.trunc(maxTokens);
+  if (clientTools !== undefined) options['clientTools'] = clientTools;
 
   const json = false;
 
@@ -315,10 +455,47 @@ export function createFacadeServer(options: FacadeServerOptions): Server {
     }
   }
 
+  interface OpenAIToolCall {
+    id: string;
+    type: 'function';
+    function: { name: string; arguments: string };
+  }
+
   async function plainCompletion(parsed: ParsedChatRequest, res: ServerResponse): Promise<void> {
-    const text = await withReconnect((client) =>
-      client.chatCompletion(parsed.messages, parsed.options),
+    let content = '';
+    const toolCalls: OpenAIToolCall[] = [];
+
+    // Internally always stream so client tool calls can be captured; the
+    // upstream pauses with a pending completion when the caller must act.
+    await withReconnect((client) =>
+      client.chatCompletionStream(parsed.messages, (event) => {
+        switch (event.type) {
+          case 'content':
+            content += event.content;
+            break;
+          case 'thinking':
+            // Reasoning is not exposed to non-streaming callers.
+            break;
+          case 'client_tool_call':
+            toolCalls.push({
+              id: String(event.toolCallId),
+              type: 'function',
+              function: {
+                name: String(event.toolName),
+                arguments: String(event.toolArguments ?? '{}'),
+              },
+            });
+            break;
+          default:
+            break;
+        }
+      }, parsed.options),
     );
+
+    const finishReason = toolCalls.length > 0 ? 'tool_calls' : 'stop';
+    const message: Record<string, unknown> = { role: 'assistant', content };
+    if (toolCalls.length > 0) message['tool_calls'] = toolCalls;
+
     sendJson(res, 200, {
       id: completionId(),
       object: 'chat.completion',
@@ -327,8 +504,8 @@ export function createFacadeServer(options: FacadeServerOptions): Server {
       choices: [
         {
           index: 0,
-          message: { role: 'assistant', content: text },
-          finish_reason: 'stop',
+          message,
+          finish_reason: finishReason,
         },
       ],
       usage: null,
@@ -347,6 +524,7 @@ export function createFacadeServer(options: FacadeServerOptions): Server {
     });
 
     let first = true;
+    let toolCallIndex = 0;
     const writeChunk = (delta: Record<string, unknown>, finishReason: string | null): void => {
       const rolePart = first ? { role: 'assistant' } : {};
       first = false;
@@ -374,11 +552,33 @@ export function createFacadeServer(options: FacadeServerOptions): Server {
         case 'thinking':
           if (options.exposeThinking) writeChunk({ reasoning_content: event.content }, null);
           break;
+        case 'client_tool_call': {
+          // Model wants a CLIENT-executable tool. Emitted as one complete
+          // tool_calls delta; the OpenAI client executes and resumes.
+          writeChunk(
+            {
+              tool_calls: [
+                {
+                  index: toolCallIndex++,
+                  id: String(event.toolCallId),
+                  type: 'function',
+                  function: {
+                    name: String(event.toolName),
+                    arguments: String(event.toolArguments ?? '{}'),
+                  },
+                },
+              ],
+            },
+            null,
+          );
+          break;
+        }
         case 'completion':
-          writeChunk({}, 'stop');
+          writeChunk({}, event.pendingToolCalls ? 'tool_calls' : 'stop');
           break;
         default:
-          // tool_call / tool_response / client_tool_call are not exposed yet.
+          // Server-side tool events (web_search etc.) are executed by the
+          // upstream itself; their results surface as normal content.
           break;
       }
     };

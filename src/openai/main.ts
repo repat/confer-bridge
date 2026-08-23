@@ -54,8 +54,9 @@ const server = createFacadeServer({
 });
 
 const port = Number(process.env['FACADE_PORT'] ?? 8080);
-server.listen(port, '127.0.0.1', () => {
-  console.log(`OpenAI-compatible facade listening on http://127.0.0.1:${port}/v1`);
+const host = process.env['FACADE_HOST'] ?? '127.0.0.1';
+server.listen(port, host, () => {
+  console.log(`OpenAI-compatible facade listening on http://${host}:${port}/v1`);
 });
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {

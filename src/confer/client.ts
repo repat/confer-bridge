@@ -35,8 +35,15 @@ export const OBSERVED_CHAT_MODEL = 'Qwen/Qwen3-235B-A22B-Instruct-2507-tput';
 export const CHAT_COMPLETIONS_PATH = '/v1/vllm/chat/completions';
 
 export interface ChatMessage {
-  role: string;
+  role: 'system' | 'user' | 'assistant' | 'developer' | 'tool_call' | 'tool_response';
   content: string;
+}
+
+/** Client-executable tool declared to the upstream (ChatRequest.clientTools). */
+export interface ClientTool {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
 }
 
 export interface ChatCompletionOptions {
@@ -50,6 +57,12 @@ export interface ChatCompletionOptions {
   thinking?: boolean;
   /** Ask the upstream to emit JSON. Browser parity default: true. */
   json?: boolean;
+  /**
+   * Client-executable tools. The upstream streams `client_tool_call` events
+   * for model-initiated calls and pauses with a pending completion; the
+   * caller resumes by including tool_call/tool_response messages.
+   */
+  clientTools?: readonly ClientTool[];
 }
 
 export type StreamEvent =
@@ -279,7 +292,7 @@ export class ConferClient {
     options: ChatCompletionOptions,
     stream: boolean,
   ): Uint8Array {
-    const payload = {
+    const payload: Record<string, unknown> = {
       messages,
       model: options.model ?? OBSERVED_CHAT_MODEL,
       temperature: options.temperature ?? 0.6,
@@ -292,6 +305,9 @@ export class ConferClient {
       thinking: options.thinking ?? true,
       json: options.json ?? true,
     };
+    if (options.clientTools && options.clientTools.length > 0) {
+      payload['clientTools'] = options.clientTools;
+    }
     return new TextEncoder().encode(JSON.stringify(payload));
   }
 }

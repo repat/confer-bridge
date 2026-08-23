@@ -47,7 +47,13 @@ class MockClient implements FacadeClient {
       throw err;
     }
     this.streamCalls++;
-    void messages;
+    this.calls.push({ messages: [...messages], options: _options ?? {} });
+    if (this.events.length === 0) {
+      // Default behaviour: answer with the canned plain response.
+      onEvent({ type: 'content', content: this.plainAnswer, model: 'test' });
+      onEvent({ type: 'completion' });
+      return;
+    }
     for (const event of this.events) onEvent(event);
   }
 
@@ -199,6 +205,204 @@ test('benign client fields (stream_options, user) are accepted and not leaked up
   }
 });
 
+test('tools are mapped to clientTools and tool_choice filters them', async () => {
+  const client = new MockClient();
+  const { server, url } = await startFacade(client);
+  try {
+    await postJson(
+      url,
+      '/v1/chat/completions',
+      JSON.stringify({
+        messages: [{ role: 'user', content: 'x' }],
+        tools: [
+          {
+            type: 'function',
+            function: { name: 'get_weather', description: 'weather lookup', parameters: { type: 'object' } },
+          },
+          {
+            type: 'function',
+            function: { name: 'get_time', description: 'clock', parameters: {} },
+          },
+        ],
+        tool_choice: { type: 'function', function: { name: 'get_time' } },
+      }),
+    );
+    assert.equal(client.calls.length, 1);
+    const tools = client.calls[0]!.options['clientTools'] as Array<{ name: string; description: string }>;
+    assert.deepEqual(tools.map((t) => t.name), ['get_time']);
+    assert.equal(tools[0]!.description, 'clock');
+  } finally {
+    server.close();
+  }
+});
+
+test('tool_choice none omits clientTools entirely', async () => {
+  const client = new MockClient();
+  const { server, url } = await startFacade(client);
+  try {
+    await postJson(
+      url,
+      '/v1/chat/completions',
+      JSON.stringify({
+        messages: [{ role: 'user', content: 'x' }],
+        tools: [{ type: 'function', function: { name: 'f', description: '', parameters: {} } }],
+        tool_choice: 'none',
+      }),
+    );
+    assert.equal(client.calls[0]!.options['clientTools'], undefined);
+  } finally {
+    server.close();
+  }
+});
+
+test('non-function tool types are rejected', async () => {
+  const { server, url } = await startFacade(new MockClient());
+  try {
+    const { status, json } = await postJson(
+      url,
+      '/v1/chat/completions',
+      JSON.stringify({
+        messages: [{ role: 'user', content: 'x' }],
+        tools: [{ type: 'code_interpreter' }],
+      }),
+    );
+    assert.equal(status, 400);
+    assert.match(json.error.message as string, /code_interpreter/);
+  } finally {
+    server.close();
+  }
+});
+
+test('resume flow: assistant.tool_calls and role:tool map to upstream tool_call/tool_response', async () => {
+  const client = new MockClient();
+  const { server, url } = await startFacade(client);
+  try {
+    await postJson(
+      url,
+      '/v1/chat/completions',
+      JSON.stringify({
+        messages: [
+          { role: 'user', content: 'what time is it?' },
+          {
+            role: 'assistant',
+            content: null,
+            tool_calls: [
+              {
+                id: 'call_abc',
+                type: 'function',
+                function: { name: 'get_time', arguments: '{"tz":"UTC"}' },
+              },
+            ],
+          },
+          { role: 'tool', tool_call_id: 'call_abc', content: '12:00' },
+        ],
+      }),
+    );
+
+    assert.equal(client.calls.length, 1);
+    assert.deepEqual(
+      client.calls[0]!.messages.slice(1),
+      [
+        {
+          role: 'tool_call',
+          content: JSON.stringify({
+            toolCallId: 'call_abc',
+            toolName: 'get_time',
+            toolArguments: '{"tz":"UTC"}',
+          }),
+        },
+        {
+          role: 'tool_response',
+          content: JSON.stringify({
+            toolCallId: 'call_abc',
+            toolName: 'get_time',
+            content: '12:00',
+          }),
+        },
+      ],
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test('tool result referencing an unknown tool_call_id is rejected', async () => {
+  const { server, url } = await startFacade(new MockClient());
+  try {
+    const { status } = await postJson(
+      url,
+      '/v1/chat/completions',
+      JSON.stringify({
+        messages: [
+          { role: 'user', content: 'x' },
+          { role: 'tool', tool_call_id: 'missing', content: 'y' },
+        ],
+      }),
+    );
+    assert.equal(status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test('non-streaming response carries tool_calls with finish_reason tool_calls', async () => {
+  const client = new MockClient();
+  client.events = [
+    { type: 'client_tool_call', toolCallId: 'call_xyz', toolName: 'get_weather', toolArguments: '{"city":"Oslo"}' },
+    { type: 'completion', pendingToolCalls: true },
+  ];
+  const { server, url } = await startFacade(client);
+  try {
+    // The facade always streams internally; with no client_tool_call handling
+    // by the caller this surfaces as message.tool_calls in the JSON response.
+    const { status, json } = await postJson(
+      url,
+      '/v1/chat/completions',
+      JSON.stringify({ messages: [{ role: 'user', content: 'weather?' }] }),
+    );
+    assert.equal(status, 200);
+    assert.equal(json.choices[0].finish_reason, 'tool_calls');
+    assert.equal(json.choices[0].message.tool_calls[0].id, 'call_xyz');
+    assert.equal(json.choices[0].message.tool_calls[0].function.name, 'get_weather');
+    assert.equal(json.choices[0].message.tool_calls[0].function.arguments, '{"city":"Oslo"}');
+  } finally {
+    server.close();
+  }
+});
+
+test('SSE streaming surfaces client_tool_call as tool_calls delta with finish_reason tool_calls', async () => {
+  const client = new MockClient();
+  client.events = [
+    { type: 'content', content: 'checking…', model: 'test' },
+    {
+      type: 'client_tool_call',
+      toolCallId: 'call_42',
+      toolName: 'get_weather',
+      toolArguments: '{"city":"Oslo"}',
+    },
+    { type: 'completion', pendingToolCalls: true },
+  ];
+  const { server, url } = await startFacade(client);
+  try {
+    const { text } = await postJson(
+      url,
+      '/v1/chat/completions',
+      JSON.stringify({ messages: [{ role: 'user', content: 'weather?' }], stream: true }),
+    );
+    const dataLines = text.split('\n').filter((l) => l.startsWith('data: ') && l !== 'data: [DONE]');
+    const chunks = dataLines.map((l) => JSON.parse(l.slice(6)));
+    const toolChunk = chunks.find((c) => c.choices[0].delta.tool_calls !== undefined);
+    assert.ok(toolChunk, 'expected a tool_calls delta chunk');
+    const delta = toolChunk.choices[0].delta.tool_calls[0];
+    assert.equal(delta.id, 'call_42');
+    assert.equal(delta.type, 'function');
+    assert.equal(delta.function.name, 'get_weather');
+    assert.equal(delta.function.arguments, '{"city":"Oslo"}');
+    assert.equal(chunks[chunks.length - 1].choices[0].finish_reason, 'tool_calls');
+  } finally {
+    server.close();
+  }
+});
 test('unknown model ids are rejected', async () => {
   const { server, url } = await startFacade(new MockClient());
   try {

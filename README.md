@@ -1,6 +1,6 @@
 # confer-bridge
 
-> ⚠️ This project was almost entirely written / reverse engineered by AI. I'm not in any way affiliated with [ConferLabs/confer.to](https://github.com/ConferLabs) or [Moxie](https://github.com/moxie0). It's was done purely out of interest and so that I can connect my OpenClaw instance to confer. You should treat this as alpha software as best, as there has been no independent security audit and I take no responsibility for any security problems that may arise. As stated in the [LICENSE](https://github.com/repat/confer-bridge/blob/main/LICENSE), it simply comes "as is". This also goes for any documentation, which might be only partially correct and up to date.
+> ⚠️ This project was almost entirely written / reverse engineered by AI. I'm not in any way affiliated with [ConferLabs/confer.to](https://github.com/ConferLabs) or [Moxie](https://github.com/moxie0). It's was done purely out of interest and so that I can connect my OpenClaw instance to confer. You should treat this as alpha software at best, as there has been no independent security audit and I take no responsibility for any security problems that may arise. As stated in the [LICENSE](https://github.com/repat/confer-bridge/blob/main/LICENSE), it simply comes "as is". This also goes for any documentation, which might be only partially correct and up to date.
 
 A personal OpenAI-compatible API gateway backed by [confer.to](https://confer.to)'s
 attested confidential-computing inference transport. Requests arrive as ordinary
@@ -159,16 +159,20 @@ Request fields fall into three categories:
 
 1. **Supported (mapped onto the upstream)**: `model`, `messages`, `stream`,
    `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`,
-   `max_tokens`
+   `max_tokens`, `tools`, `tool_choice`
 2. **Accepted and ignored** (no faithful upstream mapping, but common SDKs
    send them): `stream_options`, `user`
-3. **Rejected with an explicit 400**: everything else — tools,
-   `response_format`, `n > 1`, unknown models, …
+3. **Rejected with an explicit 400**: everything else — `response_format`,
+   `n > 1`, unknown models, …
 
-Streaming via SSE (`stream: true`) uses standard `chat.completion.chunk`
-frames terminated by `[DONE]`; upstream thinking deltas appear as
-`reasoning_content` only when `FACADE_EXPOSE_THINKING=1`. Usage statistics in
-streams are not emitted (`stream_options.include_usage` is ignored).
+**Tool calling is supported.** OpenAI function tools map onto the upstream's
+client-tool protocol: declared tools become client-executable tools; when the
+model calls one, the facade responds with standard
+`finish_reason:"tool_calls"` + `message.tool_calls` (or tool_calls deltas when
+streaming). Send the result back as a `role:"tool"` message with the matching
+`tool_call_id` and continue. Server-side tools built into confer.to (web
+search, document tools) remain active per upstream defaults and are invisible
+to the OpenAI client.
 
 ## Deploying on a Raspberry Pi
 
