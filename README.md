@@ -1,5 +1,7 @@
 # confer-bridge
 
+> ⚠️ This project was almost entirely written / reverse engineered by AI. I'm not in any way affiliated with [ConferLabs/confer.to](https://github.com/ConferLabs) or [Moxie](https://github.com/moxie0). It's was done purely out of interest and so that I can connect my OpenClaw instance to confer. You should treat this as alpha software as best, as there has been no independent security audit and I take no responsibility for any security problems that may arise. As stated in the [LICENSE](https://github.com/repat/confer-bridge/blob/main/LICENSE), it simply comes "as is". This also goes for any documentation, which might be only partially correct and up to date.
+
 A personal OpenAI-compatible API gateway backed by [confer.to](https://confer.to)'s
 attested confidential-computing inference transport. Requests arrive as ordinary
 OpenAI chat-completion calls and are forwarded through an end-to-end encrypted
@@ -238,7 +240,3 @@ src/confer/framer.ts         Chunk framing/reassembly at the documented cap
 src/openai/                  Deliberately empty boundary for the future compatibility layer
 tests/                       Crypto vectors, attestation chain, framer, loopback transport
 ```
-
-## Current status
-
-The confidential-transport stack is implemented and locally tested end to end: Noise_XX_25519_AESGCM_SHA256 handshake, TDX attestation gate (Intel JWT → key binding → claims → RTMR → sigstore), protobuf envelopes, and chunked framing — all verified against the extracted browser modules. Remaining work: obtain a session token through an authorized authentication flow (the REST side is not implemented), prove byte-level Noise interop against the production server with the harmless live test, then expose OpenAI-compatible routes.
