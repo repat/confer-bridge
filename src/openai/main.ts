@@ -44,13 +44,13 @@ let confer: ConferClient | null = null;
 const server = createFacadeServer({
   apiKey,
   exposeThinking: process.env['FACADE_EXPOSE_THINKING'] === '1',
-  getClient: async () => {
-    if (!confer) {
-      confer = buildConferClient();
-      await confer.connect();
-    }
-    return confer;
-  },
+    getClient: async () => {
+      if (!confer || !confer.isConnected) {
+        confer = buildConferClient();
+        await confer.connect();
+      }
+      return confer;
+    },
 });
 
 const port = Number(process.env['FACADE_PORT'] ?? 8080);

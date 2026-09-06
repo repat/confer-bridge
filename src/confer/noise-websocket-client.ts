@@ -125,6 +125,8 @@ export class NoiseWebsocketClient {
   private closed = false;
   /** True from connect() until the transport split; used for record tracing. */
   private handshakePhase = false;
+  /** True once a handshake completed and transport mode was entered. */
+  private wasEstablished = false;
 
   private trace(event: HandshakeTraceEvent): void {
     this.options.onHandshakeTrace?.(event);
@@ -248,6 +250,7 @@ export class NoiseWebsocketClient {
     this.trace({ step: 'message-three-sent', length: messageThree.length });
     this.session = handshake.split();
     this.handshakePhase = false;
+    this.wasEstablished = true;
     this.trace({ step: 'established' });
 
     this.keepaliveTimer = setInterval(() => {
@@ -263,7 +266,8 @@ export class NoiseWebsocketClient {
   async request(verb: string, path: string, body?: Uint8Array): Promise<WebsocketResponse> {
     return new Promise<WebsocketResponse>((resolve, reject) => {
       const settled = this.withSettlement(resolve, reject);
-      void this.sendWithHandler(verb, path, body, { resolveFirst: settled.resolve, reject: settled.reject });
+      this.sendWithHandler(verb, path, body, { resolveFirst: settled.resolve, reject: settled.reject })
+        .catch((error) => settled.reject(error));
     });
   }
 
@@ -281,7 +285,8 @@ export class NoiseWebsocketClient {
   ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       const settled = this.withSettlement(resolve, reject);
-      void this.sendWithHandler(verb, path, body, { reject: settled.reject, onEvent, onDone: settled.resolve });
+      this.sendWithHandler(verb, path, body, { reject: settled.reject, onEvent, onDone: settled.resolve })
+        .catch((error) => settled.reject(error));
     });
   }
 
@@ -291,7 +296,14 @@ export class NoiseWebsocketClient {
     body: Uint8Array | undefined,
     handler: PendingRequest,
   ): Promise<void> {
-    if (!this.session || !this.currentSocket) throw new UpstreamProtocolChangedError('request called before connect().');
+    if (!this.session || !this.currentSocket) {
+      // A previously established session that is now unusable is a transport
+      // failure (reconnectable), not a protocol change.
+      if (this.wasEstablished) {
+        throw new ConnectionClosedError(1006, 'Transport session is no longer available.');
+      }
+      throw new UpstreamProtocolChangedError('request called before connect().');
+    }
     if (this.closed) throw new TransportFrameError('Connection is closed.');
     const id = this.nextRequestId++;
     const request: WebsocketRequest = { id, verb, path };

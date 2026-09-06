@@ -175,6 +175,7 @@ interface RawStreamEvent {
 export class ConferClient {
   private readonly options: ConferClientOptions;
   private noiseClient: NoiseWebsocketClient | null = null;
+  private connecting: Promise<void> | null = null;
 
   constructor(options: ConferClientOptions) {
     this.options = options;
@@ -187,33 +188,46 @@ export class ConferClient {
   /**
    * Fetches a fresh token through the authorized provider and opens the
    * attested transport. Tokens can expire and are tied to the session;
-   * never reuse tokens copied out of a browser.
+   * never reuse tokens copied out of a browser. Concurrent callers share
+   * one in-flight connection attempt.
    */
   async connect(): Promise<void> {
     if (this.noiseClient) return;
-    const token = await this.options.tokenProvider.getToken();
-    const clientOptions: NoiseWebsocketClientOptions = {
-      token,
-      url: this.options.websocketUrl ?? OBSERVED_INFERENCE_WEBSOCKET_URL,
-      validator: this.options.validator,
-    };
-    if (this.options.socketFactory) clientOptions.socketFactory = this.options.socketFactory;
-    if (this.options.onHandshakeTrace) clientOptions.onHandshakeTrace = this.options.onHandshakeTrace;
-    const client = new NoiseWebsocketClient(clientOptions);
-    try {
-      // The keepalive interval is owned by NoiseWebsocketClient today; a
-      // per-client override is not needed for parity with the browser build.
-      await client.connect();
-    } catch (error) {
-      throw error;
+    if (this.connecting) return this.connecting;
+    this.connecting = (async () => {
+      try {
+        const token = await this.options.tokenProvider.getToken();
+        const clientOptions: NoiseWebsocketClientOptions = {
+          token,
+          url: this.options.websocketUrl ?? OBSERVED_INFERENCE_WEBSOCKET_URL,
+          validator: this.options.validator,
+        };
+        if (this.options.socketFactory) clientOptions.socketFactory = this.options.socketFactory;
+        if (this.options.onHandshakeTrace) clientOptions.onHandshakeTrace = this.options.onHandshakeTrace;
+        const client = new NoiseWebsocketClient(clientOptions);
+        await client.connect();
+        this.noiseClient = client;
+      } finally {
+        this.connecting = null;
+      }
+    })();
+    return this.connecting;
+  }
+
+  /** The live transport, (re)connecting lazily after a close. */
+  private async requireClient(): Promise<NoiseWebsocketClient> {
+    await this.connect();
+    if (!this.noiseClient) {
+      throw new UpstreamProtocolChangedError('request called before connect().');
     }
-    this.noiseClient = client;
+    return this.noiseClient;
   }
 
   /** Non-streaming chat completion; resolves with the raw UTF-8 response text. */
   async chatCompletion(messages: readonly ChatMessage[], options: ChatCompletionOptions = {}): Promise<string> {
+    const client = await this.requireClient();
     const body = this.chatRequestBody(messages, options, false);
-    const response = await this.noiseClient!.request('POST', CHAT_COMPLETIONS_PATH, body);
+    const response = await client.request('POST', CHAT_COMPLETIONS_PATH, body);
     return new TextDecoder().decode(response.body ?? new Uint8Array(0));
   }
 
@@ -228,7 +242,8 @@ export class ConferClient {
   ): Promise<void> {
     const body = this.chatRequestBody(messages, options, true);
     const model = options.model ?? OBSERVED_CHAT_MODEL;
-    await this.noiseClient!.requestStreaming('POST', CHAT_COMPLETIONS_PATH, body, (response) => {
+    const client = await this.requireClient();
+    await client.requestStreaming('POST', CHAT_COMPLETIONS_PATH, body, (response) => {
       const text = new TextDecoder().decode(response.body ?? new Uint8Array(0));
       let parsed: RawStreamEvent;
       try {
