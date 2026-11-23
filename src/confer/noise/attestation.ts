@@ -26,7 +26,7 @@
  * Every failure throws. There is deliberately no bypass option.
  */
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { createLocalJWKSet, jwtVerify, type JWTPayload } from 'jose';
+import { createLocalJWKSet, jwtVerify, errors as joseErrors, type JWTPayload } from 'jose';
 import { SigstoreVerifier } from '@freedomofpress/sigstore-browser';
 import {
   AttestationRejectedError,
@@ -91,6 +91,13 @@ export interface TdxAttestationOptions {
   sigstoreIssuer?: string;
   /** Test override for the sigstore verifier implementation. */
   sigstoreVerifierFactory?: () => SigstoreVerifierLike;
+  /** Test/transport override for fetching a refreshed JWKS. */
+  fetchImpl?: typeof fetch;
+  fetchFunction?: (input: string, init?: RequestInit) => Promise<Response>;
+  /** Override the Intel Trust Authority portal base URL. */
+  portalUrl?: string;
+  /** Override the full JWKS refresh URL. */
+  jwksUrl?: string;
 }
 
 function constantTimeEquals(a: Uint8Array, b: Uint8Array): boolean {
@@ -135,6 +142,14 @@ export class TdxAttestationValidator implements AttestationValidator {
   private readonly sigstoreEmail: string;
   private readonly sigstoreIssuer: string;
   private readonly verifierFactory: () => SigstoreVerifierLike;
+  private readonly fetchImpl: (input: string, init?: RequestInit) => Promise<Response>;
+  private readonly portalUrl: string;
+  private readonly jwksUrl: string;
+
+  private bundledKeySet: ReturnType<typeof createLocalJWKSet>;
+  private refreshedKeySet: ReturnType<typeof createLocalJWKSet> | null = null;
+  private refreshPromise: Promise<void> | null = null;
+  private lastRefreshAtMillis = 0;
 
   constructor(options: TdxAttestationOptions = {}) {
     this.jwks = options.jwks ?? INTEL_TRUST_AUTHORITY_JWKS;
@@ -144,6 +159,13 @@ export class TdxAttestationValidator implements AttestationValidator {
     this.verifierFactory =
       options.sigstoreVerifierFactory ??
       (() => new SigstoreVerifier() as unknown as SigstoreVerifierLike);
+    this.fetchImpl =
+      options.fetchFunction ??
+      options.fetchImpl ??
+      ((input: string, init?: RequestInit) => fetch(input, init));
+    this.portalUrl = (options.portalUrl ?? 'https://portal.trustauthority.intel.com').replace(/\/+$/, '');
+    this.jwksUrl = options.jwksUrl ?? `${this.portalUrl}/certs`;
+    this.bundledKeySet = createLocalJWKSet(this.jwks as Parameters<typeof createLocalJWKSet>[0]);
   }
 
   /**
@@ -174,11 +196,7 @@ export class TdxAttestationValidator implements AttestationValidator {
   ): Promise<void> {
     let jwtPayload: IntelJwtPayload;
     try {
-      const result = await jwtVerify(jwt, createLocalJWKSet(this.jwks as Parameters<typeof createLocalJWKSet>[0]), {
-        issuer: INTEL_TRUST_AUTHORITY_ISSUER,
-        clockTolerance: '1 min',
-      });
-      jwtPayload = result.payload as IntelJwtPayload;
+      jwtPayload = (await this.verifyJwt(jwt)) as IntelJwtPayload;
     } catch (error) {
       throw new AttestationRejectedError(
         `Intel Trust Authority token verification failed: ${(error as Error).message}`,
@@ -188,6 +206,85 @@ export class TdxAttestationValidator implements AttestationValidator {
     this.validatePublicKey(jwtPayload, remoteStaticKey);
     this.validateTdxClaims(jwtPayload);
     await this.validateManifest(manifest, manifestBundle, jwtPayload);
+  }
+
+  /** Verify the Intel JWT, refreshing the JWKS when the signing key is missing. */
+  private async verifyJwt(jwt: string): Promise<JWTPayload> {
+    // 1. Bundled key set (pinned at build time).
+    try {
+      return await this.verifyJwtWith(jwt, this.bundledKeySet);
+    } catch (error) {
+      if (!this.isMissingKeyError(error)) throw error;
+    }
+
+    // 2. Previously refreshed key set, if any.
+    if (this.refreshedKeySet) {
+      try {
+        return await this.verifyJwtWith(jwt, this.refreshedKeySet);
+      } catch (error) {
+        if (!this.isMissingKeyError(error)) throw error;
+      }
+    }
+
+    // 3. Fetch a fresh JWKS from Intel Trust Authority and retry.
+    await this.refreshKeys();
+    if (!this.refreshedKeySet) {
+      throw new Error('Intel Trust Authority JWKS refresh completed without a usable key set');
+    }
+    return this.verifyJwtWith(jwt, this.refreshedKeySet);
+  }
+
+  private async verifyJwtWith(
+    jwt: string,
+    keySet: ReturnType<typeof createLocalJWKSet>,
+  ): Promise<JWTPayload> {
+    const result = await jwtVerify(jwt, keySet, {
+      issuer: INTEL_TRUST_AUTHORITY_ISSUER,
+      algorithms: ['PS384', 'RS256'],
+      clockTolerance: '1 min',
+    });
+    return result.payload;
+  }
+
+  private isMissingKeyError(error: unknown): boolean {
+    return error instanceof joseErrors.JWKSNoMatchingKey;
+  }
+
+  private async refreshKeys(): Promise<void> {
+    if (this.refreshPromise) return this.refreshPromise;
+    const now = Date.now();
+    if (now - this.lastRefreshAtMillis < 30_000) {
+      throw new AttestationRejectedError('Intel Trust Authority JWKS was refreshed recently.');
+    }
+    this.lastRefreshAtMillis = now;
+    this.refreshPromise = this.fetchKeys();
+    try {
+      await this.refreshPromise;
+    } finally {
+      this.refreshPromise = null;
+    }
+  }
+
+  private async fetchKeys(): Promise<void> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20_000);
+    try {
+      const response = await this.fetchImpl(this.jwksUrl, {
+        method: 'GET',
+        headers: { Accept: 'application/json, application/jwk-set+json' },
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(`Intel Trust Authority JWKS request failed with status ${response.status}`);
+      }
+      if (response.url && response.url !== this.jwksUrl) {
+        throw new Error('Intel Trust Authority JWKS request was redirected');
+      }
+      const json = await response.json();
+      this.refreshedKeySet = createLocalJWKSet(json as Parameters<typeof createLocalJWKSet>[0]);
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   /** Module 2037 validatePublicKey: report data binds the server public key. */
